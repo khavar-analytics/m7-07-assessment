@@ -1,0 +1,312 @@
+name: Deploy Model to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_version:
+        description: >
+          Model registry version tag to deploy
+          (e.g., efficientnet-v2m-triage-v1.4.2).
+          Must be in "Production" stage in MLflow Registry with dual sign-off.
+        required: true
+        type: string
+      target_environment:
+        description: Target environment
+        required: true
+        type: choice
+        options:
+          - staging
+          - production
+        default: staging
+      skip_load_test:
+        description: Skip load test (for hotfix rollbacks only — requires lead approval)
+        required: false
+        type: boolean
+        default: false
+
+# Prevent concurrent deployments to the same environment
+concurrency:
+  group: deploy-${{ inputs.target_environment }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 123456789.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REPOSITORY: radiology-triage/inference
+  MLFLOW_TRACKING_URI: https://mlflow.internal.radiology-triage.svc/mlflow
+  # Image tag scheme must match lifecycle/model-registry.yaml tagging_scheme
+  IMAGE_TAG: ${{ inputs.model_version }}
+
+jobs:
+
+  # ── 1. Pre-deployment validation ────────────────────────────────────────
+  validate:
+    name: Validate registry promotion status
+    runs-on: ubuntu-22.04
+    outputs:
+      registry_approved: ${{ steps.check-registry.outputs.approved }}
+      production_version: ${{ steps.check-registry.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789:role/github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check MLflow registry for dual sign-off
+        id: check-registry
+        run: |
+          python scripts/ci/check_registry_promotion.py \
+            --model-version "${{ inputs.model_version }}" \
+            --required-stage "Production" \
+            --required-approvals "ML Engineer,Clinical Champion"
+          echo "approved=true" >> $GITHUB_OUTPUT
+          echo "version=${{ inputs.model_version }}" >> $GITHUB_OUTPUT
+
+      - name: Check ECR image exists with matching tag
+        run: |
+          # Image tag must match model version tag (registry/image consistency check)
+          aws ecr describe-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-ids imageTag=${{ env.IMAGE_TAG }} \
+            --region ${{ env.AWS_REGION }}
+          echo "Image ${{ env.IMAGE_TAG }} confirmed in ECR"
+
+      - name: Scan image for critical CVEs
+        run: |
+          # Fail deployment if Inspector found critical CVEs since last scan
+          python scripts/ci/check_ecr_scan.py \
+            --repository ${{ env.ECR_REPOSITORY }} \
+            --image-tag ${{ env.IMAGE_TAG }} \
+            --max-severity CRITICAL \
+            --fail-on-findings
+
+  # ── 2. Build TRT engine (if not already cached in registry) ─────────────
+  build-trt-engine:
+    name: Build / verify TRT engine for A10G
+    runs-on: [self-hosted, gpu, a10g]  # Self-hosted runner with A10G GPU
+    needs: validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789:role/github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check if TRT engine already exists in S3
+        id: check-trt
+        run: |
+          if aws s3 ls "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/${{ inputs.model_version }}/model_trt_fp16_a10g.plan" 2>&1; then
+            echo "trt_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "trt_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download ONNX model from MLflow
+        if: steps.check-trt.outputs.trt_exists == 'false'
+        run: |
+          aws s3 cp \
+            "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/${{ inputs.model_version }}/model.onnx" \
+            ./model.onnx
+
+      - name: Build TRT FP16 engine
+        if: steps.check-trt.outputs.trt_exists == 'false'
+        run: |
+          docker run --gpus all --rm \
+            -v $(pwd):/workspace \
+            nvcr.io/nvidia/tensorrt:24.04-py3 \
+            trtexec \
+              --onnx=/workspace/model.onnx \
+              --saveEngine=/workspace/model_trt_fp16_a10g.plan \
+              --fp16 \
+              --minShapes=input:1x3x512x512 \
+              --optShapes=input:8x3x512x512 \
+              --maxShapes=input:16x3x512x512 \
+              --workspace=4096
+
+      - name: Upload TRT engine to S3
+        if: steps.check-trt.outputs.trt_exists == 'false'
+        run: |
+          aws s3 cp \
+            ./model_trt_fp16_a10g.plan \
+            "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/${{ inputs.model_version }}/model_trt_fp16_a10g.plan"
+
+  # ── 3. Smoke test ────────────────────────────────────────────────────────
+  smoke-test:
+    name: Smoke test (CPU/ONNX, 10 synthetic studies)
+    runs-on: ubuntu-22.04
+    needs: [validate, build-trt-engine]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run smoke test against staging inference pod
+        run: |
+          python scripts/ci/smoke_test.py \
+            --model-version "${{ inputs.model_version }}" \
+            --endpoint "https://api.staging.radiology-triage.internal/v1" \
+            --studies 10 \
+            --expected-model-version "${{ inputs.model_version }}" \
+            --max-latency-ms 8000  # relaxed for CI; production SLO is 4000 ms
+
+      - name: Verify X-Model-Version header
+        run: |
+          # Confirms the X-Model-Version header (defined in api/openapi.yaml)
+          # matches the deployed model version. This is the same value
+          # checked by the ModelVersionMismatch alert in monitoring/alerts.yaml.
+          python scripts/ci/check_model_version_header.py \
+            --endpoint "https://api.staging.radiology-triage.internal/v1/model/info" \
+            --expected-version "${{ inputs.model_version }}"
+
+  # ── 4. Load test (staging only) ──────────────────────────────────────────
+  load-test:
+    name: Load test (Scenarios 1+2 from serving/load-test-plan.md)
+    runs-on: ubuntu-22.04
+    needs: smoke-test
+    if: inputs.target_environment == 'staging' && inputs.skip_load_test == false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install k6
+        run: |
+          curl -fsSL https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update && sudo apt-get install k6
+
+      - name: Run Scenario 1 — steady state (30 studies/min, 15 min)
+        run: |
+          k6 run \
+            --env MODEL_VERSION=${{ inputs.model_version }} \
+            --env TARGET_RPS=0.5 \
+            --env DURATION=15m \
+            --out json=results/scenario1.json \
+            scripts/load-test/scenario1_steady_state.js
+
+      - name: Run Scenario 2 — peak load (100 studies/min, 15 min)
+        run: |
+          k6 run \
+            --env MODEL_VERSION=${{ inputs.model_version }} \
+            --env TARGET_RPS=1.67 \
+            --env DURATION=15m \
+            --out json=results/scenario2.json \
+            scripts/load-test/scenario2_peak_load.js
+
+      - name: Evaluate load test results against SLOs
+        run: |
+          # Pass/fail criteria mirror serving/slos.yaml:
+          #   SLO-LAT-01: p95 ≤ 4000 ms
+          #   SLO-ERR-01: error rate < 0.5%
+          #   SLO-THR-01: drop rate < 0.1%
+          python scripts/ci/evaluate_load_test.py \
+            --results results/scenario1.json results/scenario2.json \
+            --p95-threshold-ms 4000 \
+            --error-rate-threshold 0.005 \
+            --drop-rate-threshold 0.001
+
+      - name: Upload load test results
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-test-results-${{ inputs.model_version }}
+          path: results/
+
+  # ── 5. Canary deploy ─────────────────────────────────────────────────────
+  canary-deploy:
+    name: Canary deploy (5% traffic, 24h soak)
+    runs-on: ubuntu-22.04
+    needs: [smoke-test, load-test]
+    if: always() && (needs.load-test.result == 'success' || inputs.skip_load_test == true)
+    environment:
+      name: ${{ inputs.target_environment }}
+      url: https://api.${{ inputs.target_environment }}.radiology-triage.internal
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789:role/github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy canary pod (5% traffic weight)
+        run: |
+          # Update K8s deployment with new MODEL_VERSION env var on canary pod
+          # Image tag = model version tag (consistent with lifecycle/model-registry.yaml)
+          kubectl set image deployment/triton-inference-canary \
+            triton=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
+            --namespace radiology-triage
+          kubectl set env deployment/triton-inference-canary \
+            MODEL_VERSION=${{ inputs.model_version }} \
+            --namespace radiology-triage
+          # Istio VirtualService: 5% weight to canary, 95% to stable
+          kubectl apply -f k8s/virtualservice-canary-5pct.yaml
+
+      - name: Wait for canary pod readiness
+        run: |
+          kubectl rollout status deployment/triton-inference-canary \
+            --namespace radiology-triage \
+            --timeout=120s
+
+      - name: Monitor canary for 24 hours
+        run: |
+          echo "Canary deployed. 24-hour soak period begins."
+          echo "Monitor: https://grafana.internal/d/radiology-triage-canary"
+          echo "Rollback: run runbooks/rollback.md procedures or trigger rollback workflow"
+          # Note: Automated rollback is triggered by monitoring/alerts.yaml
+          # CanaryLatencyBreach or CanaryErrorRateHigh alerts via PagerDuty webhook.
+
+  # ── 6. Full production promotion ─────────────────────────────────────────
+  promote-to-production:
+    name: Promote canary to 100% production
+    runs-on: ubuntu-22.04
+    needs: canary-deploy
+    if: inputs.target_environment == 'production'
+    # This job is triggered manually after 24h canary soak passes
+    environment:
+      name: production
+      url: https://api.radiology-triage.internal
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789:role/github-actions-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Promote stable deployment to new version
+        run: |
+          kubectl set image deployment/triton-inference-stable \
+            triton=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
+            --namespace radiology-triage
+          kubectl set env deployment/triton-inference-stable \
+            MODEL_VERSION=${{ inputs.model_version }} \
+            --namespace radiology-triage
+          # Route 100% traffic to stable (now on new version)
+          kubectl apply -f k8s/virtualservice-stable-100pct.yaml
+          kubectl rollout status deployment/triton-inference-stable \
+            --namespace radiology-triage \
+            --timeout=180s
+
+      - name: Archive previous production model version in registry
+        run: |
+          python scripts/ci/archive_previous_production.py \
+            --new-version "${{ inputs.model_version }}" \
+            --archive-reason "Superseded by ${{ inputs.model_version }}"
+
+      - name: Post deployment summary
+        run: |
+          echo "## Deployment Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- Model version: \`${{ inputs.model_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Image tag: \`${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: ${{ inputs.target_environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- X-Model-Version header: \`${{ inputs.model_version }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Rollback: see runbooks/rollback.md" >> $GITHUB_STEP_SUMMARY
