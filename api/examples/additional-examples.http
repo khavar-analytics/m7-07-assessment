@@ -1,1 +1,111 @@
+# ── Example 1: Study still being processed (202 Accepted) ──────────────────
 
+# Request
+GET /v1/studies/1.2.840.10008.5.1.4.1.1.2.999/result HTTP/1.1
+Host: api.radiology-triage.internal
+Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+
+# Response
+HTTP/1.1 202 Accepted
+Content-Type: application/json
+Retry-After: 2
+
+{
+  "studyId": "1.2.840.10008.5.1.4.1.1.2.999",
+  "status": "inferring",
+  "receivedAt": "2026-06-07T14:25:00.000Z",
+  "estimatedCompletionMs": 1800
+}
+
+
+# ── Example 2: Routine study result ────────────────────────────────────────
+
+# Request
+GET /v1/studies/1.2.840.10008.5.1.4.1.1.2.555/result HTTP/1.1
+Host: api.radiology-triage.internal
+Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+
+# Response
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Model-Version: efficientnet-v2m-triage-v1.4.2
+X-Request-ID: 7c1d9e2f-3b4a-5678-c9d0-e1f2a3b4c5d6
+X-Correlation-ID: 2a3b4c5d-6e7f-8901-bcde-f23456789012
+
+{
+  "studyId": "1.2.840.10008.5.1.4.1.1.2.555",
+  "urgencyScore": 23.1,
+  "urgencyClass": "ROUTINE",
+  "modelVersion": "efficientnet-v2m-triage-v1.4.2",
+  "processedAt": "2026-06-07T14:24:45.213Z",
+  "inferenceLatencyMs": 87,
+  "endToEndLatencyMs": 891,
+  "auditId": "f9e8d7c6-b5a4-3210-fedc-ba9876543210",
+  "sliceCount": 6
+}
+
+
+# ── Example 3: Audit log query ─────────────────────────────────────────────
+
+# Request
+GET /v1/audit/predictions?modelVersion=efficientnet-v2m-triage-v1.4.2&from=2026-06-07T00:00:00Z&limit=2 HTTP/1.1
+Host: api.radiology-triage.internal
+Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...  # scope: audit:read
+
+# Response
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Model-Version: efficientnet-v2m-triage-v1.4.2
+
+{
+  "records": [
+    {
+      "auditId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+      "studyId": "1.2.840.10008.5.1.4.1.1.2.1",
+      "modelVersion": "efficientnet-v2m-triage-v1.4.2",
+      "inputHash": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "urgencyScore": 91.4,
+      "urgencyClass": "STAT",
+      "processedAt": "2026-06-07T14:23:11.847Z",
+      "radiologistAcknowledgedAt": "2026-06-07T14:31:05.000Z"
+    },
+    {
+      "auditId": "f9e8d7c6-b5a4-3210-fedc-ba9876543210",
+      "studyId": "1.2.840.10008.5.1.4.1.1.2.555",
+      "modelVersion": "efficientnet-v2m-triage-v1.4.2",
+      "inputHash": "sha256:7d793037a0760186574b0282f2f435e7",
+      "urgencyScore": 23.1,
+      "urgencyClass": "ROUTINE",
+      "processedAt": "2026-06-07T14:24:45.213Z",
+      "radiologistAcknowledgedAt": null
+    }
+  ],
+  "total": 847
+}
+
+# ── Example 4: Failed Inference ─────────────────────────────────────────────
+HTTP/1.1 500 Internal Server Error
+Content-Type: application/json
+X-Request-ID: ...
+
+{
+  "studyId": "1.2.840.10008.5.1.4.1.1.2.777",
+  "status": "failed",
+  "errorCode": "INFERENCE_FAILED",
+  "message": "Model inference failed after retry",
+  "retryable": false
+}
+
+
+# ── Example 5: Not Found ─────────────────────────────────────────────
+
+HTTP/1.1 404 Not Found
+
+{
+  "error": "STUDY_NOT_FOUND",
+  "message": "No study found with given ID"
+}
+
+
+# ── Example 6: Unauthorized ─────────────────────────────────────────────
+HTTP/1.1 401 Unauthorized
