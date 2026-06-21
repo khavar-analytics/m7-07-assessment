@@ -1,1 +1,335 @@
+# Monitoring Alerts — Radiology Triage Inference Service
+# Backend: Prometheus + Alertmanager → PagerDuty + SIEM
+#
+# Thresholds here are CONSISTENT with:
+#   - serving/slos.yaml (SLO definitions)
+#   - runbooks/rollback.md (rollback trigger thresholds)
+#   - api/openapi.yaml (X-Model-Version header definition)
+#
+# Alert naming convention: <Component><Condition>
+# Severity levels: critical (page immediately), warning (ticket + monitor)
 
+groups:
+
+  # ── Latency Alerts ──────────────────────────────────────────────────────
+  - name: latency
+    rules:
+
+      - alert: E2ELatencyHigh
+        # Warning: approaching SLO-LAT-01 threshold (4 000 ms)
+        expr: >
+          histogram_quantile(0.95,
+            rate(study_e2e_latency_ms_bucket[5m])
+          ) > 3500
+        for: 5m
+        labels:
+          severity: warning
+          slo: SLO-LAT-01
+          team: ml-platform
+        annotations:
+          summary: "p95 end-to-end latency approaching SLO budget"
+          description: >
+            p95 e2e latency is {{ $value | humanize }}ms (warning threshold: 3500ms,
+            SLO-LAT-01 budget: 4000ms). Check Kafka consumer lag and GPU utilization.
+          runbook: "https://wiki.internal/runbooks/radiology-triage/latency"
+          dashboard: "https://grafana.internal/d/radiology-triage-latency"
+
+      - alert: E2ELatencySLOBreach
+        # Critical: SLO-LAT-01 breached — triggers rollback consideration
+        # Threshold matches breach_threshold_ms in serving/slos.yaml SLO-LAT-01
+        expr: >
+          histogram_quantile(0.95,
+            rate(study_e2e_latency_ms_bucket[5m])
+          ) > 4000
+        for: 3m
+        labels:
+          severity: critical
+          slo: SLO-LAT-01
+          team: ml-platform
+          pagerduty: true
+        annotations:
+          summary: "CRITICAL: p95 e2e latency breaching SLO-LAT-01"
+          description: >
+            p95 e2e latency is {{ $value | humanize }}ms, exceeding SLO-LAT-01
+            budget of 4000ms for 3+ minutes. Radiologist triage may be impacted.
+            Consult runbooks/rollback.md for rollback triggers.
+          runbook: "https://wiki.internal/runbooks/radiology-triage/rollback"
+
+      - alert: GPUInferenceLatencyHigh
+        # SLO-LAT-03: GPU inference p95 > 1500 ms
+        expr: >
+          histogram_quantile(0.95,
+            rate(triton_inference_request_duration_us_bucket[5m])
+          ) / 1000 > 1500
+        for: 5m
+        labels:
+          severity: warning
+          slo: SLO-LAT-03
+          team: ml-platform
+        annotations:
+          summary: "GPU inference p95 latency above threshold"
+          description: >
+            GPU inference p95 is {{ $value | humanize }}ms (SLO-LAT-03 threshold: 1500ms).
+            May indicate GPU memory pressure, thermal throttling, or oversized batch.
+
+  # ── Availability Alerts ─────────────────────────────────────────────────
+  - name: availability
+    rules:
+
+      - alert: InferencePodDown
+        # SLO-AVL-02: at least 1 Triton pod must be available at all times
+        expr: >
+          kube_deployment_status_replicas_available{
+            deployment="triton-inference-stable",
+            namespace="radiology-triage"
+          } < 1
+        for: 1m
+        labels:
+          severity: critical
+          slo: SLO-AVL-02
+          team: ml-platform
+          pagerduty: true
+        annotations:
+          summary: "CRITICAL: No Triton inference pods available"
+          description: >
+            All Triton GPU pods are down. Triage scoring has stopped.
+            Studies are accumulating in Kafka (dicom.ready). Radiologists
+            are not receiving automated urgency scores.
+          runbook: "https://wiki.internal/runbooks/radiology-triage/rollback"
+
+      - alert: LatencyBudgetDegraded
+        # Fires when system is in CPU fallback mode (GPU unavailable)
+        # p95 expected 6000–8000 ms in CPU mode
+        expr: >
+          histogram_quantile(0.95,
+            rate(study_e2e_latency_ms_bucket[5m])
+          ) > 6000
+        for: 2m
+        labels:
+          severity: critical
+          team: ml-platform
+          pagerduty: true
+        annotations:
+          summary: "CRITICAL: System in degraded latency mode (possible CPU fallback)"
+          description: >
+            p95 e2e latency is {{ $value | humanize }}ms — consistent with
+            CPU-only inference mode. GPU pods may be restarting.
+            Radiologists should be notified that automated triage is degraded.
+          runbook: "https://wiki.internal/runbooks/radiology-triage/rollback"
+
+      - alert: ErrorBudgetBurnRateFast
+        # SLO-AVL-01: burn rate alert (5× threshold → page)
+        expr: >
+          (
+            1 - avg_over_time(up{job="radiology-triage-inference"}[1h])
+          ) / (1 - 0.999) > 5
+        for: 5m
+        labels:
+          severity: critical
+          slo: SLO-AVL-01
+          team: ml-platform
+          pagerduty: true
+        annotations:
+          summary: "Error budget burning 5× faster than allowed rate"
+          description: >
+            The service is consuming its availability error budget 5× faster
+            than the monthly allowance. At this rate, the monthly budget
+            (43.8 minutes downtime) will be exhausted within ~6 days.
+            Consider freezing non-emergency deployments per error_budget_policy.
+
+  # ── Error Rate Alerts ───────────────────────────────────────────────────
+  - name: error_rate
+    rules:
+
+      - alert: InferenceErrorRateHigh
+        # Warning: approaching SLO-ERR-01 threshold (0.5%)
+        expr: >
+          rate(study_inference_errors_total[5m]) /
+          rate(study_inference_total[5m]) * 100 > 1.0
+        for: 5m
+        labels:
+          severity: warning
+          slo: SLO-ERR-01
+          team: ml-platform
+        annotations:
+          summary: "Inference error rate above 1%"
+          description: >
+            {{ $value | humanize }}% of studies are failing inference
+            (SLO-ERR-01 limit: 0.5%). Check Triton logs and Kafka dead-letter queue.
+
+      - alert: InferenceErrorRateCritical
+        # Critical: rollback trigger — see runbooks/rollback.md §AutomaticTriggers
+        expr: >
+          rate(study_inference_errors_total[5m]) /
+          rate(study_inference_total[5m]) * 100 > 5.0
+        for: 2m
+        labels:
+          severity: critical
+          slo: SLO-ERR-01
+          team: ml-platform
+          pagerduty: true
+        annotations:
+          summary: "CRITICAL: Inference error rate > 5% — rollback trigger"
+          description: >
+            {{ $value | humanize }}% of studies are failing inference.
+            This exceeds the rollback trigger threshold of 5% defined in
+            runbooks/rollback.md. Initiate rollback procedure immediately.
+          runbook: "https://wiki.internal/runbooks/radiology-triage/rollback"
+
+  # ── Audit Completeness Alert ────────────────────────────────────────────
+  - name: audit
+    rules:
+
+      - alert: AuditRecordMissing
+        # SLO-AUD-01: any miss is a P1 regulatory incident
+        expr: >
+          (
+            rate(audit_records_written_total[5m]) /
+            rate(study_scores_dispatched_total[5m]) * 100
+          ) < 99.99
+        for: 1m
+        labels:
+          severity: critical
+          slo: SLO-AUD-01
+          team: ml-platform
+          regulatory: true
+          pagerduty: true
+        annotations:
+          summary: "CRITICAL: Audit record completeness below 100% — regulatory incident"
+          description: >
+            Audit record completeness is {{ $value | humanize }}%
+            (SLO-AUD-01 requires 100%). This is a regulatory incident.
+            Inference has been halted (circuit breaker active).
+            Notify compliance officer and initiate incident procedure.
+          runbook: "https://wiki.internal/runbooks/radiology-triage/audit-failure"
+
+  # ── Model Version Consistency Alert ────────────────────────────────────
+  - name: model_version
+    rules:
+
+      - alert: ModelVersionMismatch
+        # SLO-MOD-01: X-Model-Version header must match Production registry version
+        # This alert is also referenced in:
+        #   - api/openapi.yaml (X-Model-Version header description)
+        #   - serving/slos.yaml (SLO-MOD-01)
+        #   - lifecycle/model-registry.yaml (tagging_scheme notes)
+        #   - cicd/.github/workflows/deploy-model.yml (smoke test step)
+        expr: >
+          count(
+            triton_model_version_served != on() group_left()
+            mlflow_registry_production_version
+          ) > 0
+        for: 2m
+        labels:
+          severity: critical
+          slo: SLO-MOD-01
+          team: ml-platform
+          pagerduty: true
+        annotations:
+          summary: "CRITICAL: Serving model version does not match registry Production version"
+          description: >
+            Triton is serving model version {{ $labels.served_version }} but
+            the MLflow registry Production version is {{ $labels.registry_version }}.
+            The X-Model-Version response header (defined in api/openapi.yaml) is
+            returning the wrong version. This may indicate a mis-deployed pod or
+            a failed model swap. Verify deployment state and rollback if necessary.
+          runbook: "https://wiki.internal/runbooks/radiology-triage/rollback"
+
+  # ── Kafka / Throughput Alerts ───────────────────────────────────────────
+  - name: kafka
+    rules:
+
+      - alert: KafkaConsumerLagHigh
+        # Consumer lag > 500 studies on dicom.ready indicates inference is falling behind
+        # Threshold matches load test pass criteria in serving/load-test-plan.md
+        expr: >
+          kafka_consumer_group_lag{
+            topic="dicom.ready",
+            consumer_group="triton-inference"
+          } > 500
+        for: 5m
+        labels:
+          severity: warning
+          team: ml-platform
+        annotations:
+          summary: "Kafka consumer lag on dicom.ready is high"
+          description: >
+            Consumer lag on dicom.ready is {{ $value }} studies. Studies may be
+            processed beyond the 4000ms SLO. Check GPU pod health and consider
+            scaling inference pods.
+
+      - alert: KafkaConsumerLagCritical
+        expr: >
+          kafka_consumer_group_lag{
+            topic="dicom.ready",
+            consumer_group="triton-inference"
+          } > 2000
+        for: 5m
+        labels:
+          severity: critical
+          team: ml-platform
+          pagerduty: true
+        annotations:
+          summary: "CRITICAL: Kafka consumer lag > 2000 studies — SLO breach imminent"
+          description: >
+            Consumer lag on dicom.ready is {{ $value }} studies. Studies are
+            accumulating faster than inference can process them. p95 latency
+            SLO-LAT-01 is likely already breached. Immediate GPU scaling or
+            rollback required.
+          runbook: "https://wiki.internal/runbooks/radiology-triage/rollback"
+
+      - alert: DicomGatewayConnectionLost
+        expr: >
+          dicom_gateway_active_connections == 0
+        for: 2m
+        labels:
+          severity: critical
+          team: integration
+          pagerduty: true
+        annotations:
+          summary: "CRITICAL: DICOM Gateway has no active PACS connections"
+          description: >
+            No PACS connections are active on the DICOM Gateway. No new studies
+            are being received. Studies are queued on the PACS side.
+            Check VPN/network connectivity and PACS configuration.
+
+  # ── Canary-Specific Alerts ──────────────────────────────────────────────
+  - name: canary
+    rules:
+
+      - alert: CanaryLatencyBreach
+        # Triggers automated canary rollback in deploy pipeline
+        expr: >
+          histogram_quantile(0.95,
+            rate(study_e2e_latency_ms_bucket{deployment="canary"}[5m])
+          ) > 4000
+        for: 5m
+        labels:
+          severity: critical
+          team: ml-platform
+          pagerduty: true
+          canary: "true"
+        annotations:
+          summary: "CRITICAL: Canary deployment breaching latency SLO — rollback"
+          description: >
+            Canary model version is producing p95 e2e latency of {{ $value | humanize }}ms,
+            exceeding SLO-LAT-01 (4000ms). Automated rollback of canary recommended.
+            See runbooks/rollback.md §CanaryRollback.
+          runbook: "https://wiki.internal/runbooks/radiology-triage/rollback"
+
+      - alert: CanaryErrorRateHigh
+        expr: >
+          rate(study_inference_errors_total{deployment="canary"}[5m]) /
+          rate(study_inference_total{deployment="canary"}[5m]) * 100 > 2.0
+        for: 3m
+        labels:
+          severity: critical
+          team: ml-platform
+          pagerduty: true
+          canary: "true"
+        annotations:
+          summary: "CRITICAL: Canary error rate > 2% — rollback"
+          description: >
+            Canary is producing {{ $value | humanize }}% inference errors.
+            Rollback canary immediately. See runbooks/rollback.md §CanaryRollback.
+          runbook: "https://wiki.internal/runbooks/radiology-triage/rollback"
