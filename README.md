@@ -1,128 +1,86 @@
-![logo_ironhack_blue 7](https://user-images.githubusercontent.com/23629340/40541063-a07a0a8a-601a-11e8-91b5-2f13e4e6b441.png)
+# Radiology Triage Assistant — Scenario Z
 
-# Assessment | Design & Ship an MLOps System
+## Executive Summary
 
-## Overview
+This system is a **real-time chest X-ray triage assistant** embedded in a hospital radiology workflow. A deep-learning model scores every incoming DICOM study for urgency (0–100) within 4 seconds, allowing radiologists to read the most critical studies first. The platform ingests up to 100 studies per minute at peak, processes multi-slice DICOM packages up to 80 MB, routes studies to radiologist worklists via a REST API, and emits a full audit trail for every prediction — satisfying FDA Software as a Medical Device (SaMD) and HIPAA data-residency requirements. Model versions are promoted only after dual sign-off; every production inference is logged with the exact model version, input hash, and output score for post-market surveillance.
 
-You will produce a complete MLOps design dossier for a fresh business scenario, integrating every artifact you've practiced this week. The deliverable is a single repository that another team could pick up on Monday and start building from. No model training, no notebooks — this is a systems and operations exercise.
+All system metrics, logs, and audit records are tagged with `X-Model-Version` to ensure full traceability across the pipeline.
 
-The assessment covers the full Unit 7 arc: architecture → lifecycle → packaging → API contract → capacity & SLOs → CI/CD & monitoring. You will reuse every skill from the week's labs.
+The system operates as a near-real-time (asynchronous) pipeline due to large DICOM payloads and processing constraints.
 
-**Time budget:** Friday class. **Submission deadline:** Sunday 7 Jun 2026, 23:59 local time.
+## Architecture Diagram
 
-## Learning Goals Verified
+```mermaid
+flowchart TD
+    PACS["PACS / Modality\n(DICOM C-STORE)"]
+    GW["DICOM Gateway\n(Orthanc + stow-rs)"]
+    IQ["Ingestion Queue\n(Kafka topic: dicom.raw)"]
+    PRE["Pre-processor Pod\n(decompress, resize, normalize)"]
+    MQ["Inference Queue\n(Kafka topic: dicom.ready)"]
+    INF["Inference Service\n(Triton Inference Server\n2× A10G GPU)"]
+    POST["Post-processor\n(score threshold, routing)"]
+    WL["Worklist API\n(RIS integration)"]
+    AUDIT["Audit Store\n(Postgres + S3 immutable log)"]
+    ALERT["Alerting\n(PagerDuty / SIEM)"]
+    MON["Monitoring\n(Prometheus + Grafana)"]
 
-This assessment verifies that you can:
-
-- Translate a business scenario into a defensible architecture
-- Specify the MLOps lifecycle and registry that surrounds a production model
-- Package a containerized inference service with a slim, secure image
-- Author a complete API contract (OpenAPI 3.1) with sync, batch, and async endpoints
-- Plan capacity, SLOs, and a meaningful load test
-- Wire up CI/CD and monitoring with explicit gates and burn-rate alerts
-- Write a rollback runbook a tired on-call could execute
-
-## Pick One Scenario
-
-You **must** pick a scenario you did **not** use in earlier labs. Choose one:
-
-### Scenario X — Personalized in-app recommendations (B2C retail)
-
-A mobile retail app needs personalized product recommendations rendered on every home-screen load. ~800 RPS at peak, p95 latency budget 120 ms end-to-end. Personalization signals include the user's last 30 days of browsing and purchases. Cold-start users (no history) must still get reasonable recommendations. The product team will run A/B tests against the model continuously.
-
-### Scenario Y — Predictive maintenance for industrial sensors (B2B IoT)
-
-A factory automation product ingests vibration and temperature time-series from ~50,000 industrial sensors. The model predicts which sensors will fail in the next 72 hours. Decisions are made by maintenance schedulers reviewing a daily report; a small subset of critical sensors needs near-real-time alerting (<5 minutes from anomaly to alert). Data arrives via MQTT to a cloud ingestion layer.
-
-### Scenario Z — Medical-imaging triage assistant (B2B healthcare)
-
-A radiology workflow tool routes chest X-ray studies to radiologists based on a model's urgency score. ~30 studies/minute average, 100/minute peak. Each study can be up to 80 MB across multiple DICOM slices. p95 latency budget 4 seconds. **Regulated environment** — every prediction must be auditable; model promotion requires sign-off; data residency rules apply.
-
-## Deliverables
-
-Your submission is a single Git repository with this structure:
-
-```
-README.md                          # 1-page navigation + executive summary
-architecture/
-  architecture.md                  # diagram (Mermaid or PNG + source)
-  JUSTIFICATION.md                 # pattern choice and trade-offs
-  adr/
-    0001-<slug>.md                 # the single most consequential trade-off
-    0002-<slug>.md                 # one more
-lifecycle/
-  lifecycle.md                     # end-to-end diagram
-  model-registry.yaml              # registry spec
-container/
-  Dockerfile                       # multi-stage; will not be built, but must be reviewable
-  README.md                        # image plan: bake-vs-mount, base, size estimate
-api/
-  openapi.yaml                     # full 3.1 spec, lint-clean
-  examples/                        # sample request/response payloads
-serving/
-  capacity-plan.md
-  slos.yaml
-  load-test-plan.md
-cicd/
-  .github/workflows/deploy-model.yml
-monitoring/
-  alerts.yaml
-runbooks/
-  rollback.md
+    PACS -->|TLS DICOM| GW
+    GW --> IQ
+    IQ --> PRE
+    PRE --> MQ
+    MQ --> INF
+    INF --> POST
+    POST --> WL
+    POST --> AUDIT
+    POST --> MON
+    INF --> MON
+    MON --> ALERT
 ```
 
-Yes, it's a lot. None of it is new — you've produced every piece this week. The assessment is whether you can put them together **coherently around one scenario** with consistent assumptions, consistent terminology, and no contradictions.
+## Key Numbers
 
-## What "coherent" means
+| Parameter | Value |
+|---|---|
+| Average throughput | 30 studies / min |
+| Peak throughput | 100 studies / min |
+| p95 end-to-end latency budget | 4 000 ms |
+| p99 end-to-end latency budget | 7 000 ms |
+| Max study size | 80 MB (multi-slice DICOM) |
+| Model | EfficientNet-V2-M + custom head (~28 M params) |
+| Model artifact size (TensorRT FP16) | ~110 MB |
+| GPU hardware | 2× NVIDIA A10G (24 GB VRAM each) |
+| CPU fallback | 4× c6i.4xlarge (CPU-only, degraded latency) |
+| Estimated monthly infra cost | ~$4 200 (GPU nodes + storage + data transfer) |
+| Availability SLO | 99.9 % (≤ 43.8 min downtime/month) |
+| Prediction latency SLO (p95) | ≤ 4 000 ms |
+| Audit log retention | 10 years (regulatory requirement) |
+| Data residency | Single-region (us-east-1 default; configurable) |
 
-This is the bar that separates an A from a B:
+## Navigation
 
-- **The capacity plan assumes the same RPS and latency budget the SLO file declares.**
-- **The OpenAPI spec's `X-Model-Version` header appears in the monitoring alert that detects mismatches.**
-- **The rollback runbook's trigger thresholds match the alerts defined in `monitoring/alerts.yaml`.**
-- **The Dockerfile and the capacity plan agree on whether the model is baked in or mounted.**
-- **The CI/CD pipeline tags images with the same scheme the registry expects.**
+| Area | Primary Artifact |
+|---|---|
+| Architecture | [architecture/architecture.md](architecture/architecture.md) |
+| Pattern justification | [architecture/JUSTIFICATION.md](architecture/JUSTIFICATION.md) |
+| ADR 0001 — GPU vs CPU serving | [architecture/adr/0001-gpu-vs-cpu-serving.md](architecture/adr/0001-gpu-vs-cpu-serving.md) |
+| ADR 0002 — Async queue vs sync REST | [architecture/adr/0002-async-queue-vs-sync-rest.md](architecture/adr/0002-async-queue-vs-sync-rest.md) |
+| ML Lifecycle | [lifecycle/lifecycle.md](lifecycle/lifecycle.md) |
+| Model Registry spec | [lifecycle/model-registry.yaml](lifecycle/model-registry.yaml) |
+| Dockerfile | [container/Dockerfile](container/Dockerfile) |
+| Container README | [container/README.md](container/README.md) |
+| OpenAPI spec | [api/openapi.yaml](api/openapi.yaml) |
+| API examples | [api/examples/](api/examples/) |
+| Capacity plan | [serving/capacity-plan.md](serving/capacity-plan.md) |
+| SLOs | [serving/slos.yaml](serving/slos.yaml) |
+| Load test plan | [serving/load-test-plan.md](serving/load-test-plan.md) |
+| CI/CD pipeline | [cicd/.github/workflows/deploy-model.yml](cicd/.github/workflows/deploy-model.yml) |
+| Monitoring alerts | [monitoring/alerts.yaml](monitoring/alerts.yaml) |
+| Rollback runbook | [runbooks/rollback.md](runbooks/rollback.md) |
 
-A bag of disconnected artifacts is a fail. A consistent system is a pass.
+## Open Questions
 
-## Top-level README
+1. **Regulatory classification depth** — Is this system classified as a Class II or Class III SaMD under 21 CFR Part 820? The answer changes whether we need a 510(k) clearance pathway and how strictly the model-promotion sign-off process must be documented. We need a regulatory affairs review before the first production deployment.
 
-Your repo's root `README.md` must include:
+2. **RIS/PACS integration contract** — The worklist push currently assumes HL7 v2.5 ORM messages over MLLP. If the hospital uses FHIR R4 ServiceRequest instead, the post-processor and the OpenAPI contract for `/studies/{studyId}/result` need a second transport adapter. Confirm with the integration team on day one.
 
-1. **One-paragraph executive summary** — what the system does and which scenario it solves
-2. **Architecture diagram** — embedded or linked
-3. **Key numbers** — a small table: target RPS, p95 budget, SLO objectives, model size, hardware choice, monthly cost estimate
-4. **Navigation** — links to each sub-directory's primary artifact
-5. **Open questions** — 2–3 honest things you'd need to confirm with the team if you were building this Monday
-
-The README is what a reviewer reads first. Make it earn the rest.
-
-## Submission
-
-Open a Pull Request to the assessment repository with the full directory structure above. Paste the PR link as your deliverable.
-
-**Deadline:** Sunday 7 Jun 2026, 23:59 local time. Late submissions are scored at 70% maximum.
-
-## Grading Rubric
-
-| Area | Weight | What we look for |
-|---|---|---|
-| Architecture coherence | 20% | Diagram, justification, ADRs hang together and address the scenario |
-| Lifecycle & registry | 15% | Specific gates, named approvers, lineage fields, not generic |
-| Container plan | 10% | Multi-stage, bake-vs-mount justified, image size estimate sane |
-| API contract | 15% | OpenAPI lint-clean, sync+batch+async, structured errors, observability headers |
-| Capacity & SLOs | 15% | Latency budget balances, replica math defensible, SLOs measurable |
-| CI/CD pipeline | 10% | Multi-stage, dependency-chained, security scan, env-gated production |
-| Monitoring & alerts | 10% | Multi-window burn-rate, drift signal, model-version mismatch alert |
-| Rollback runbook | 5% | Checklist-format, measurable triggers, sub-page length |
-
-Coherence across these areas is judged in addition to each area individually — a fragmented submission can score well on each piece and still fail.
-
-## Tips
-
-- **Start with the executive summary.** If you can write one paragraph that fits the whole system, the pieces will line up. If you can't, the pieces aren't aligned yet.
-- **Reuse the artifacts** you produced this week as starting points — adapt them to the new scenario, don't rewrite from scratch.
-- **Pick the easy scenario for your context.** Scenario Z (medical imaging) is the hardest because of the regulatory dimension; Scenario X is the most familiar shape. Pick what you can execute well, not what sounds impressive.
-- **Cut, don't pad.** A tight 50-page repo beats a sprawling 150-page one. Be specific.
-
-Good luck.
+3. **DICOM de-identification boundary** — PHI is currently stripped at the DICOM Gateway before hitting Kafka. We need to confirm with the CISO whether the Kafka brokers and S3 audit bucket must be encrypted at rest with customer-managed keys (CMK) or if AWS-managed keys (SSE-S3) satisfy the BAA. This affects key-management cost and operational complexity significantly.
