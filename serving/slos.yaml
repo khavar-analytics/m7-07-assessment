@@ -1,1 +1,152 @@
+# SLO Definitions — Radiology Triage Inference Service
+# These values are the authoritative source for:
+#   - Alert thresholds in monitoring/alerts.yaml
+#   - Rollback trigger thresholds in runbooks/rollback.md
+#   - Load test pass/fail criteria in serving/load-test-plan.md
+# Any change here must be reflected in those files simultaneously.
 
+service: radiology-triage-inference
+version: "1.0"
+effective_date: "2026-06-07"
+review_cycle: quarterly
+
+slos:
+
+  # ── Latency SLOs ────────────────────────────────────────────────────────
+  - id: SLO-LAT-01
+    name: End-to-End Prediction Latency p95
+    description: |
+      Time from DICOM study receipt at the Gateway to audit record written
+      and worklist push dispatched. Measured via X-Correlation-ID trace.
+    target: 4000  # milliseconds
+    percentile: p95
+    window: rolling_5m
+    # Matches capacity plan: p95 measured e2e = ~3 200 ms, budget = 4 000 ms.
+    alert_threshold_ms: 3500   # warn before breaching SLO
+    breach_threshold_ms: 4000  # triggers SLO breach alert → rollback consideration
+    measurement_source: prometheus
+    metric: "histogram_quantile(0.95, rate(study_e2e_latency_ms_bucket[5m]))"
+
+  - id: SLO-LAT-02
+    name: End-to-End Prediction Latency p99
+    description: p99 latency for worst-case (max-slice) studies
+    target: 7000  # milliseconds
+    percentile: p99
+    window: rolling_5m
+    alert_threshold_ms: 6000
+    breach_threshold_ms: 7000
+    metric: "histogram_quantile(0.99, rate(study_e2e_latency_ms_bucket[5m]))"
+
+  - id: SLO-LAT-03
+    name: GPU Inference Latency p95
+    description: |
+      Time spent inside Triton for the model forward pass only.
+      Excludes pre/post-processing and Kafka transit.
+    target: 1500  # milliseconds (generous; allows for worst-case 48-slice study)
+    percentile: p95
+    window: rolling_5m
+    metric: "histogram_quantile(0.95, rate(triton_inference_request_duration_us_bucket[5m])) / 1000"
+
+  # ── Availability SLOs ───────────────────────────────────────────────────
+  - id: SLO-AVL-01
+    name: Service Availability
+    description: |
+      Percentage of studies successfully processed end-to-end.
+      A failed request is any study that is received but not successfully processed.
+    target_percent: 99.9
+    window: rolling_30d
+    error_budget_minutes_per_month: 43.8
+    alert_burn_rate_threshold: 5x
+    metric: >
+      sum(rate(study_processed_success_total[5m])) /
+      sum(rate(study_received_total[5m]))
+
+  - id: SLO-AVL-02
+    name: Inference Pod Availability
+    description: At least one Triton GPU pod healthy at all times.
+    target_percent: 99.95
+    window: rolling_30d
+    metric: "min(kube_deployment_status_replicas_available{deployment='triton-inference'})"
+    minimum_replicas: 1
+
+  # ── Throughput SLOs ─────────────────────────────────────────────────────
+  - id: SLO-THR-01
+    name: Peak Throughput Handling
+    description: |
+      System must sustain 100 studies/min for 10 consecutive minutes without
+      latency SLO breach or study drop. Studies are "dropped" if they are
+      not processed within 10 minutes of Gateway receipt (Kafka TTL).
+    target_studies_per_min: 100
+    sustained_duration_min: 10
+    max_drop_rate_percent: 0.1  # < 0.1% of studies may be dropped at peak
+    measurement: load_test  # verified in serving/load-test-plan.md
+
+
+  # ── Queue Delay SLO ───────────────────────────────────────────────────
+  - id: SLO-QUE-01
+    name: Kafka Queue Delay
+    description: |
+      Maximum allowed delay between message ingestion and consumption.
+      Ensures near-real-time processing under burst conditions.
+    target_seconds: 2
+    percentile: p95
+    window: rolling_5m
+    alert_threshold_seconds: 1.5
+    breach_threshold_seconds: 2
+    metric: "histogram_quantile(0.95, rate(kafka_message_delay_seconds_bucket[5m]))"
+    notes: "Used for backpressure control and rollback trigger conditions."
+
+  # ── Error Rate SLOs ─────────────────────────────────────────────────────
+  - id: SLO-ERR-01
+    name: Inference Error Rate
+    description: |
+      Fraction of studies that fail inference (Triton returns non-200, or
+      post-processor cannot compute a valid score). Failed studies are
+      re-queued once; if they fail again, they are flagged for manual review
+      and the radiologist worklist receives an error notification.
+    target_error_rate_percent: 0.5  # < 0.5% of studies may error
+    window: rolling_1h
+    alert_threshold_percent: 1.0
+    metric: "rate(study_inference_errors_total[1h]) / rate(study_inference_total[1h]) * 100"
+
+  # ── Audit Completeness SLO ──────────────────────────────────────────────
+  - id: SLO-AUD-01
+    name: Audit Record Completeness
+    description: |
+      Every study processed must have a corresponding audit record in Postgres
+      within 10 seconds of the score being dispatched to the RIS. This is a
+      regulatory hard requirement (not a target — any miss is a P1 incident).
+      This constraint is aligned with the overall 4-second processing SLO plus asynchronous audit write delay tolerance.
+    target_percent: 100.0
+    window: rolling_1d
+    alert_threshold_percent: 99.99  # any miss pages immediately
+    metric: >
+      (rate(audit_records_written_total[5m]) /
+       rate(study_scores_dispatched_total[5m])) * 100
+    severity: critical
+    notes: "Breach of this SLO triggers immediate incident + regulatory notification."
+
+
+  # ── Model Version Consistency SLO ───────────────────────────────────────
+  - id: SLO-MOD-01
+    name: Model Version Consistency
+    description: |
+      All inference responses must return an X-Model-Version header matching
+      the Production version in the model registry.
+    target_percent: 100.0
+    window: rolling_5m
+    metric: "rate(model_version_mismatch_total[5m])"
+    alert: ModelVersionMismatch
+
+
+# Error budget policy
+error_budget_policy:
+  policy: stop_feature_work
+  description: |
+    When remaining error budget for SLO-AVL-01 falls below 10% of the monthly
+    allocation (< 4.4 minutes remaining), all non-emergency deployments are
+    frozen until the budget resets or is restored via remediation.
+  enforcement: manual  # enforced by on-call lead
+  exceptions:
+    - security_patches
+    - rollback_operations
