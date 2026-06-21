@@ -1,1 +1,466 @@
+openapi: "3.1.0"
+info:
+  title: Radiology Triage Assistant API
+  version: "1.4.2"
+  description: |
+    REST API for the Radiology Triage Assistant. Provides study submission status,
+    urgency score retrieval, audit log queries, and model health endpoints.
 
+    **Note:** The inference hot path is async (DICOM Gateway → Kafka → Triton).
+    This API is a read/query interface and a thin write interface for study metadata.
+    All endpoints require a valid JWT bearer token with audience `radiology-triage`.
+
+    The `X-Model-Version` response header is present on every `/studies` and
+    `/studies/{studyId}/result` response. It contains the model registry tag
+    of the model that produced the score (e.g., `efficientnet-v2m-triage-v1.4.2`).
+    The monitoring alert `ModelVersionMismatch` fires when this value deviates
+    from the expected Production version registered in the model registry.
+  contact:
+    name: ML Platform Team
+    email: ml-platform@radiology-triage.internal
+  license:
+    name: Proprietary
+
+servers:
+  - url: https://api.radiology-triage.internal/v1
+    description: Production (us-east-1)
+  - url: https://api.staging.radiology-triage.internal/v1
+    description: Staging
+
+security:
+  - BearerAuth: []
+
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Service health check
+      description: Returns 200 if all critical dependencies (Kafka, Postgres, Triton) are healthy.
+      security: []
+      tags: [Health]
+      responses:
+        "200":
+          description: All systems healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: One or more dependencies unhealthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /studies:
+    get:
+      operationId: listStudies
+      summary: List recently processed studies
+      description: Returns a paginated list of studies processed within the last 24 hours, ordered by urgency score descending.
+      tags: [Studies]
+      parameters:
+        - name: stage
+          in: query
+          schema:
+            type: string
+            enum: [STAT, URGENT, ROUTINE, ALL]
+            default: ALL
+        - name: since
+          in: query
+          description: ISO 8601 timestamp; return studies processed after this time
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: cursor
+          in: query
+          description: Pagination cursor from previous response
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Study list
+          headers:
+            X-Model-Version:
+              $ref: "#/components/headers/X-Model-Version"
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StudyListResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /studies/{studyId}/result:
+    get:
+      operationId: getStudyResult
+      summary: Get urgency score for a study
+      description: |
+        Returns the urgency score and classification for a specific study.
+        The `X-Model-Version` header identifies which model version produced this score.
+        Results are available within p95 = 4 000 ms of the study arriving at the DICOM Gateway.
+      tags: [Studies]
+      parameters:
+        - name: studyId
+          in: path
+          required: true
+          description: DICOM Study Instance UID (de-identified)
+          schema:
+            type: string
+            pattern: "^[0-9.]+$"
+            maxLength: 64
+      responses:
+        "200":
+          description: Study result available
+          headers:
+            X-Model-Version:
+              $ref: "#/components/headers/X-Model-Version"
+            X-Request-ID:
+              $ref: "#/components/headers/X-Request-ID"
+            X-Correlation-ID:
+              $ref: "#/components/headers/X-Correlation-ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StudyResult"
+        "202":
+          description: Study received but inference not yet complete
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+                description: Seconds to wait before retrying
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StudyPending"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /audit/predictions:
+    get:
+      operationId: queryAuditLog
+      summary: Query prediction audit log
+      description: |
+        Query the immutable prediction audit log. Requires `audit:read` scope.
+        Results include the model version, input hash, score, and radiologist
+        acknowledgement timestamp for every prediction.
+      tags: [Audit]
+      security:
+        - BearerAuth: [audit:read]
+      parameters:
+        - name: studyId
+          in: query
+          schema:
+            type: string
+        - name: modelVersion
+          in: query
+          description: Filter by model version tag (e.g., efficientnet-v2m-triage-v1.4.2)
+          schema:
+            type: string
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        "200":
+          description: Audit records
+          headers:
+            X-Model-Version:
+              $ref: "#/components/headers/X-Model-Version"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditLogResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /model/info:
+    get:
+      operationId: getModelInfo
+      summary: Current production model information
+      description: Returns the active model version, stage, and key metrics from the registry.
+      tags: [Model]
+      responses:
+        "200":
+          description: Model info
+          headers:
+            X-Model-Version:
+              $ref: "#/components/headers/X-Model-Version"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelInfo"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT with `aud: radiology-triage`. Scopes include `studies:read`, `audit:read`.
+
+  headers:
+    X-Model-Version:
+      description: |
+        Model registry tag of the model that produced the score in this response.
+        Format: `{model-family}-v{semver}` (e.g., `efficientnet-v2m-triage-v1.4.2`).
+        Monitored by the `ModelVersionMismatch` alert in monitoring/alerts.yaml.
+      schema:
+        type: string
+        example: "efficientnet-v2m-triage-v1.4.2"
+    X-Request-ID:
+      description: UUID for this HTTP request, for distributed tracing.
+      schema:
+        type: string
+        format: uuid
+    X-Correlation-ID:
+      description: Correlation ID propagated from the original Kafka message (traces study end-to-end).
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, checks, timestamp]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        checks:
+          type: object
+          properties:
+            kafka:
+              type: string
+              enum: [ok, error]
+            postgres:
+              type: string
+              enum: [ok, error]
+            triton:
+              type: string
+              enum: [ok, error]
+            s3:
+              type: string
+              enum: [ok, error]
+        timestamp:
+          type: string
+          format: date-time
+
+    StudyResult:
+      type: object
+      required: [studyId, urgencyScore, urgencyClass, modelVersion, processedAt, auditId]
+      properties:
+        studyId:
+          type: string
+          description: De-identified DICOM Study Instance UID
+          example: "1.2.840.10008.5.1.4.1.1.2.1"
+        urgencyScore:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 100
+          description: Model confidence score (0=routine, 100=most urgent)
+          example: 91.4
+        urgencyClass:
+          type: string
+          enum: [STAT, URGENT, ROUTINE]
+          description: |
+            Classification derived from score thresholds:
+            STAT ≥ 85 | URGENT 60–84 | ROUTINE < 60
+          example: STAT
+        modelVersion:
+          type: string
+          description: Registry tag of the model that produced this score
+          example: "efficientnet-v2m-triage-v1.4.2"
+        processedAt:
+          type: string
+          format: date-time
+          description: UTC timestamp when the score was written to the audit store
+        inferenceLatencyMs:
+          type: integer
+          description: GPU inference time in milliseconds (not including pre/post-processing)
+          example: 124
+        endToEndLatencyMs:
+          type: integer
+          description: Total time from DICOM Gateway receipt to audit write (ms)
+          example: 2847
+        auditId:
+          type: string
+          format: uuid
+          description: Immutable audit record ID in Postgres audit_predictions table
+        sliceCount:
+          type: integer
+          description: Number of DICOM slices processed for this study
+          example: 14
+
+    StudyPending:
+      type: object
+      required: [studyId, status, receivedAt]
+      properties:
+        studyId:
+          type: string
+        status:
+          type: string
+          enum: [received, preprocessing, inferring]
+        receivedAt:
+          type: string
+          format: date-time
+        estimatedCompletionMs:
+          type: integer
+          description: Estimated milliseconds until result is available
+
+    StudyListResponse:
+      type: object
+      required: [studies, total, cursor]
+      properties:
+        studies:
+          type: array
+          items:
+            $ref: "#/components/schemas/StudyResult"
+        total:
+          type: integer
+        cursor:
+          type: string
+          nullable: true
+          description: Pass as `cursor` param for next page; null when no more results
+
+    AuditLogResponse:
+      type: object
+      required: [records, total]
+      properties:
+        records:
+          type: array
+          items:
+            type: object
+            required: [auditId, studyId, modelVersion, inputHash, urgencyScore, urgencyClass, processedAt]
+            properties:
+              auditId:
+                type: string
+                format: uuid
+              studyId:
+                type: string
+              modelVersion:
+                type: string
+                example: "efficientnet-v2m-triage-v1.4.2"
+              inputHash:
+                type: string
+                description: SHA-256 of the normalized pixel tensor (for reproducibility audit)
+              urgencyScore:
+                type: number
+              urgencyClass:
+                type: string
+                enum: [STAT, URGENT, ROUTINE]
+              processedAt:
+                type: string
+                format: date-time
+              radiologistAcknowledgedAt:
+                type: string
+                format: date-time
+                nullable: true
+        total:
+          type: integer
+
+    ModelInfo:
+      type: object
+      properties:
+        productionVersion:
+          type: string
+          example: "efficientnet-v2m-triage-v1.4.2"
+        stage:
+          type: string
+          enum: [Production]
+        promotedAt:
+          type: string
+          format: date-time
+        metrics:
+          type: object
+          properties:
+            aucRocOverall:
+              type: number
+            sensitivityStatAt95Spec:
+              type: number
+            calibrationEce:
+              type: number
+        stagingVersion:
+          type: string
+          nullable: true
+          example: "efficientnet-v2m-triage-v1.5.0-rc1"
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        requestId:
+          type: string
+          format: uuid
+
+  responses:
+    BadRequest:
+      description: Invalid request parameters
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid JWT
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: JWT valid but insufficient scope
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Study not found
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RateLimited:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
