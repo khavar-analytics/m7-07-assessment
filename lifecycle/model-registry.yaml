@@ -1,1 +1,142 @@
+# Model Registry Specification
+# Backend: MLflow Model Registry (managed on AWS, us-east-1)
+# All fields are required unless marked optional.
 
+registry:
+  backend: mlflow
+  tracking_uri: "https://mlflow.internal.radiology-triage.svc/mlflow"
+  artifact_store: "s3://radiology-triage-mlflow-artifacts-us-east-1"
+  encryption: "SSE-KMS"
+  kms_key_alias: "alias/radiology-triage-mlflow"
+  retention_years: 10  # Regulatory requirement: 21 CFR Part 820
+
+model_family:
+  name: "efficientnet-v2m-triage"
+  description: >
+    EfficientNet-V2-M backbone with a 3-class urgency classification head
+    (STAT / URGENT / ROUTINE) for chest X-ray triage. Fine-tuned on 
+    de-identified retrospective chest PA/AP studies.
+  task: "image-classification"
+  input_schema:
+    type: tensor
+    dtype: float32
+    shape: [batch, 3, 512, 512]  # B × C × H × W, normalized [0,1]
+  output_schema:
+    type: tensor
+    dtype: float32
+    shape: [batch, 3]            # logits → softmax → [p_stat, p_urgent, p_routine]
+
+versions:
+  # Production version — currently serving 100% of traffic
+  - version: "1.4.2"
+    stage: Production
+    image_tag: "efficientnet-v2m-triage-v1.4.2"   # matches CI/CD tag scheme
+    registered_at: "2026-05-14T09:22:00Z"
+    promoted_to_production_at: "2026-05-21T14:05:00Z"
+    approvals:
+      - approver: "ml-engineer-lead"
+        role: "ML Engineer"
+        timestamp: "2026-05-21T13:45:00Z"
+        signature_hash: "sha256:a3f9..."  # HMAC of approval payload
+      - approver: "dr-chen-radiology"
+        role: "Clinical Champion"
+        timestamp: "2026-05-21T14:05:00Z"
+        signature_hash: "sha256:b71c..."
+    artifacts:
+      weights: "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/1.4.2/model.pth"
+      trt_engine_a10g: "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/1.4.2/model_trt_fp16_a10g.plan"
+      onnx: "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/1.4.2/model.onnx"
+      eval_report: "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/1.4.2/eval_report.pdf"
+    metrics:
+      auc_roc_overall: 0.947
+      sensitivity_stat_at_95spec: 0.961
+      specificity_stat: 0.954
+      subgroup_auc_gap_max: 0.031
+      calibration_ece: 0.018
+      shadow_kl_divergence: 0.08  # vs previous production model
+    dataset_version: "chest-xray-triage-v3.2"
+    dataset_sha256: "e7f3a2b19c4d8a..."
+    framework: "pytorch==2.2.1+cu121"
+    python_version: "3.11.8"
+    training_hardware: "4× A100 80GB"
+    training_duration_hours: 6.3
+
+  # Staging version — shadow scoring in progress
+  - version: "1.5.0-rc1"
+    stage: Staging
+    image_tag: "efficientnet-v2m-triage-v1.5.0-rc1"
+    registered_at: "2026-06-03T11:15:00Z"
+    promoted_to_staging_at: "2026-06-05T08:30:00Z"
+    approvals: []  # awaiting dual sign-off for Production promotion
+    shadow_scoring:
+      started_at: "2026-06-05T08:35:00Z"
+      studies_scored: 1842
+      kl_divergence_current: 0.06
+      status: in_progress
+    artifacts:
+      weights: "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/1.5.0-rc1/model.pth"
+      trt_engine_a10g: "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/1.5.0-rc1/model_trt_fp16_a10g.plan"
+      onnx: "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/1.5.0-rc1/model.onnx"
+    metrics:
+      auc_roc_overall: 0.953
+      sensitivity_stat_at_95spec: 0.968
+      calibration_ece: 0.015
+    dataset_version: "chest-xray-triage-v3.3"
+
+  # Previous production — archived after v1.4.2 promotion
+  - version: "1.3.1"
+    stage: Archived
+    image_tag: "efficientnet-v2m-triage-v1.3.1"
+    promoted_to_production_at: "2026-02-10T11:20:00Z"
+    archived_at: "2026-05-21T14:10:00Z"
+    archive_reason: "Superseded by v1.4.2 — improved sensitivity on portable AP studies"
+    artifacts:
+      weights: "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/1.3.1/model.pth"
+      # TRT engine retained for audit replay capability
+      trt_engine_a10g: "s3://radiology-triage-mlflow-artifacts-us-east-1/efficientnet-v2m-triage/1.3.1/model_trt_fp16_a10g.plan"
+
+promotion_rules:
+  candidate_to_staging:
+    auto: true
+    conditions:
+      - metric: auc_roc_overall
+        operator: ">="
+        threshold: 0.92
+      - metric: sensitivity_stat_at_95spec
+        operator: ">="
+        threshold: 0.95
+      - metric: subgroup_auc_gap_max
+        operator: "<="
+        threshold: 0.05
+      - regulatory_validation_document: required  # IRB + clinical sign-off PDF attached
+
+  staging_to_production:
+    auto: false  # always requires manual approval
+    minimum_shadow_studies: 500
+    minimum_shadow_hours: 72
+    conditions:
+      - metric: shadow_kl_divergence
+        operator: "<="
+        threshold: 0.15
+    required_approvals:
+      - role: "ML Engineer"
+        count: 1
+      - role: "Clinical Champion"
+        count: 1
+    approval_expiry_hours: 48  # approvals expire if deploy not triggered within 48h
+
+  production_to_archived:
+    auto: true
+    trigger: "superseded_by_new_production_version"
+
+tagging_scheme:
+  format: "{model_family}-v{semver}"
+  examples:
+    - "efficientnet-v2m-triage-v1.4.2"
+    - "efficientnet-v2m-triage-v1.5.0-rc1"
+  # Image tags in container registry must match this scheme exactly.
+  # The CI/CD pipeline (cicd/.github/workflows/deploy-model.yml) tags
+  # Docker images using the same format. The Triton model config references
+  # the same tag. The X-Model-Version response header returns this tag.
+  # Monitoring alert ModelVersionMismatch fires when header tag ≠ registry
+  # Production version tag.
