@@ -1,1 +1,28 @@
+# GET /v1/studies/1.2.840.10008.5.1.4.1.1.2.1/result
+# Successful STAT result
 
+# Request
+GET /v1/studies/1.2.840.10008.5.1.4.1.1.2.1/result HTTP/1.1
+Host: api.radiology-triage.internal
+Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+Accept: application/json
+
+# Response
+HTTP/1.1 200 OK
+Content-Type: application/json
+X-Model-Version: efficientnet-v2m-triage-v1.4.2
+X-Request-ID: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+X-Correlation-ID: 9b2e1c8d-4a3f-41e7-b6d2-8f0e3a9c1b54
+Cache-Control: no-store
+
+{
+  "studyId": "1.2.840.10008.5.1.4.1.1.2.1",
+  "urgencyScore": 91.4,
+  "urgencyClass": "STAT",
+  "modelVersion": "efficientnet-v2m-triage-v1.4.2",
+  "processedAt": "2026-06-07T14:23:11.847Z",
+  "inferenceLatencyMs": 124,
+  "endToEndLatencyMs": 2847,
+  "auditId": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+  "sliceCount": 14
+}
